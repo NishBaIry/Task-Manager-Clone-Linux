@@ -1,0 +1,377 @@
+================================================================================
+                        TASK MANAGER — PROJECT SUMMARY
+              OS Concepts Used & How the Application Works
+================================================================================
+  Course: CS235AI — Operating Systems (Semester III)
+  Syllabus Reference: Units I – V
+================================================================================
+
+
+1. PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+A Windows Task Manager clone for Linux. A C backend reads live process and
+GPU data from the kernel via the /proc virtual filesystem, and a Python /
+Tkinter GUI renders it in real time. The two communicate through a pipe (IPC).
+
+
+2. ARCHITECTURE
+--------------------------------------------------------------------------------
+
+    ┌─────────────────────┐   pipe (stdout)   ┌──────────────────────────┐
+    │   C Backend         │ ─────────────────► │   Python / Tkinter GUI   │
+    │  (task_manager.c)   │                    │  (main_window.py, etc.)  │
+    │                     │                    │                          │
+    │  • reads /proc      │                    │  • processes view        │
+    │  • calculates CPU%  │                    │  • performance graphs    │
+    │  • runs nvidia-smi  │                    │  • kill / end task       │
+    │  • loops every 2 s  │                    │  • icon loading          │
+    └─────────────────────┘                    └──────────────────────────┘
+
+  - The C backend is compiled automatically by the Python launcher (gcc).
+  - It runs as a child process; the GUI reads its stdout in a background thread.
+  - The GUI also uses the psutil library for system-wide stats (CPU freq,
+    memory, disk, network, temperatures) that do not require the C backend.
+
+
+================================================================================
+3. OS CONCEPTS MAPPED TO SYLLABUS
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+UNIT I — Introduction, System Structures, Process Management
+────────────────────────────────────────────────────────────────────────────────
+
+3.1  Process Concept & Process Information
+      Where: task_manager.c — read_process_info()
+
+      Linux represents every running process as a numbered directory inside
+      the /proc virtual filesystem.  The backend walks /proc with opendir /
+      readdir, skips non-numeric entries, and for each PID reads:
+
+        /proc/<pid>/comm    → process name (1 read per process)
+        /proc/<pid>/stat    → state character (R / S / D / Z / T …)
+                              and user-space + kernel-space CPU tick counts
+                              (utime, stime)
+        /proc/<pid>/status  → thread count (Threads: field)
+                              and resident memory (VmRSS: field, in KB)
+
+      These are the same fields the kernel exposes for every process — the
+      same data a system-level "ps" command would read.
+
+3.2  Operations on Processes — Kill / Force Kill
+      Where: processes_view.py — _kill_selected() / _force_kill()
+
+      The GUI lets the user terminate a process in two ways:
+        • End Task  → sends SIGTERM (signal 15) — polite request to exit.
+        • Force Kill → sends SIGKILL (signal 9) — immediate, un-catchable.
+      Both use the system call:  os.kill(pid, signal)
+      This is a direct application of "operations on processes" from Unit I.
+
+3.3  Process Creation (fork + exec, via subprocess)
+      Where: main_window.py — _start_backend()
+
+      The Python launcher creates two child processes:
+        1. gcc  (compilation)  — subprocess.run(['gcc', ...])
+        2. The compiled C backend — subprocess.Popen([backend_path], ...)
+      Under the hood, subprocess uses fork() + exec() on Linux.
+      In the C backend, popen("nvidia-smi ...") similarly forks a child to
+      query the GPU.
+
+
+────────────────────────────────────────────────────────────────────────────────
+UNIT I — System Structures & System Calls
+────────────────────────────────────────────────────────────────────────────────
+
+3.4  System Calls Used in the C Backend
+      Where: task_manager.c (various functions)
+
+      File / Directory I/O calls (to read /proc):
+        opendir(), readdir(), closedir()   — directory traversal
+        fopen(), fclose(), fgets(), fscanf() — sequential file reads
+
+      Process-related calls:
+        popen(), pclose()                  — pipe to child process (nvidia-smi)
+        sysconf(_SC_NPROCESSORS_ONLN)      — query number of online CPU cores
+        sleep(2)                           — suspend the backend loop
+
+      Signal-related calls (Python side):
+        os.kill(pid, SIGTERM / SIGKILL)    — send signals to target processes
+
+      These illustrate the boundary between user-space code and kernel
+      services: every piece of data displayed comes through a system call.
+
+
+────────────────────────────────────────────────────────────────────────────────
+UNIT II — Multithreaded Programming
+────────────────────────────────────────────────────────────────────────────────
+
+3.5  Threading Model in the GUI
+      Where: main_window.py — _start_backend(), _read_backend()
+
+      The application uses two threads:
+
+        Main Thread        — runs the Tkinter event loop (mainloop).
+                              Handles all widget drawing and user input.
+
+        Reader Thread      — created with threading.Thread(daemon=True).
+                              Sits in a blocking loop reading lines from the
+                              C backend's stdout pipe.  Whenever a complete
+                              frame arrives (terminated by "END"), it hands
+                              the data to the main thread.
+
+      Why two threads?  Tkinter widgets are NOT thread-safe.  The reader
+      thread must not touch any widget directly.  Instead it uses:
+
+          self.root.after(0, self._update_processes, frame.copy())
+
+      root.after() schedules a callback on the main thread's event loop.
+      This is the application's thread-safety mechanism — equivalent to
+      posting a message to a GUI dispatcher.
+
+      The daemon=True flag means the reader thread dies automatically when
+      the main thread exits (no explicit join needed).
+
+3.6  Why Not Use Threads in the C Backend?
+      The C backend is a single-threaded infinite loop:
+          while (1) { read_process_info(); output_gpu_info(); sleep(2); }
+      Each iteration scans all of /proc sequentially.  Because the work is
+      I/O-bound (reading small proc files) and the loop sleeps most of the
+      time, a single thread is sufficient and avoids synchronization
+      complexity.
+
+
+────────────────────────────────────────────────────────────────────────────────
+UNIT II — CPU Scheduling Concepts (Calculation, not simulation)
+────────────────────────────────────────────────────────────────────────────────
+
+3.7  How CPU Usage % Is Calculated
+      Where: task_manager.c — get_total_cpu_time(), calculate_cpu_usage()
+
+      The backend does NOT simulate a scheduler; instead it observes the
+      kernel's own scheduling decisions by reading CPU tick counters.
+
+      Step-by-step (runs every 2 seconds):
+
+        a) Read /proc/stat → get system-wide ticks:
+               total = user + nice + system + idle
+           Compute:  delta_total = total_now − total_last
+
+        b) For each process, read /proc/<pid>/stat → get:
+               utime  (ticks in user mode)
+               stime  (ticks in kernel mode)
+           Compute:  delta_proc = (utime+stime)_now − (utime+stime)_last
+
+        c) CPU % for the process:
+               cpu_pct = (delta_proc / delta_total) × 100 / num_cores
+
+           num_cores comes from sysconf(_SC_NPROCESSORS_ONLN).
+           Dividing by cores normalises the percentage so that a fully
+           saturated single core shows 100 %, not (100 × cores) %.
+
+      This is the standard "snapshot-delta" method the kernel itself uses
+      to track scheduling time.  A lookup table (cpu_table[]) stores each
+      process's last tick snapshot for O(n) delta computation.
+
+3.8  Sorting by CPU Usage
+      Where: task_manager.c — read_process_info() (bubble sort at the end)
+
+      After collecting all process data, the backend sorts the array by
+      cpu_usage descending.  This ensures the most CPU-intensive processes
+      appear at the top — a priority-based presentation of scheduling
+      activity.
+
+
+────────────────────────────────────────────────────────────────────────────────
+UNIT III — Process Synchronization & IPC
+────────────────────────────────────────────────────────────────────────────────
+
+3.9  Inter-Process Communication via Pipe
+      Where: main_window.py + task_manager.c
+
+      The C backend and Python frontend are separate processes.  They
+      communicate through a PIPE — one of the classic IPC mechanisms.
+
+        Backend side:  printf(...) + fflush(stdout)
+                       Writes pipe-delimited records to its stdout.
+
+        Frontend side: subprocess.Popen(..., stdout=PIPE)
+                       The reader thread does a blocking readline() on the
+                       pipe's read end.
+
+      Protocol (text-based, line-oriented):
+        • Each process:   PID|name|state|cpu|mem|threads\n
+        • End of frame:   END\n
+        • GPU block:      GPU_START\n  GPU|...\n ...  GPU_END\n
+
+      This is a textual, framed protocol over a byte-stream pipe —
+      illustrating how IPC requires an agreed-upon message boundary
+      convention (here: newline-delimited, frame-terminated with "END").
+
+3.10 Thread Synchronization — Shared Flag
+      Where: main_window.py — self.running
+
+      The boolean self.running is written by the main thread (_on_close)
+      and read by the reader thread (loop condition).  In CPython the GIL
+      makes a single boolean write/read atomic, so no explicit lock is
+      needed here.  This is the simplest form of inter-thread signalling.
+
+3.11 GUI Thread Safety via Callback Scheduling
+      Where: main_window.py — root.after(0, callback, data)
+
+      Because Tkinter widgets cannot be updated from a non-main thread, the
+      reader thread never touches a widget.  Instead it posts a zero-delay
+      callback onto the main event loop.  This is functionally equivalent
+      to a single-producer / single-consumer queue protected by a mutex —
+      the event loop serialises all widget updates.
+
+
+────────────────────────────────────────────────────────────────────────────────
+UNIT IV — Main Memory Management
+────────────────────────────────────────────────────────────────────────────────
+
+3.12 Resident Set Size (RSS) — Paging in Action
+      Where: task_manager.c — get_process_memory()
+
+      The backend reads VmRSS from /proc/<pid>/status.  VmRSS is the
+      "Resident Set Size" — the number of pages of the process that are
+      currently mapped into physical RAM.
+
+      Why RSS and not virtual size?
+        • A process's virtual address space (VmSize) can be very large
+          (includes mapped-but-not-yet-touched pages).
+        • RSS tells the user how much physical memory the process is
+          actually consuming right now — directly tied to the paging
+          mechanism.  Pages not in RAM are on disk (swapped out).
+
+      The GUI formats RSS in MiB or GiB and colour-codes the cell based on
+      magnitude, giving an instant visual indicator of memory pressure.
+
+3.13 System-Wide Memory Stats
+      Where: performance_view.py — update()  (uses psutil)
+
+      The Performance tab shows:
+        In Use      — physical memory currently allocated to processes.
+        Available   — memory the kernel can hand out without swapping.
+        Cached      — pages in the page cache (filesystem data).  These
+                      can be reclaimed instantly if memory pressure rises.
+        Total       — physical RAM installed.
+
+      "Available" is the key metric for understanding whether the system
+      is under memory pressure or approaching thrashing territory.
+
+3.14 Fixed-Size History Buffers (Bounded Allocation)
+      Where: graph_widget.py, performance_view.py
+
+      All history arrays use collections.deque(maxlen=60).  When a new
+      sample arrives and the buffer is full, the oldest entry is
+      automatically discarded.  This is a circular-buffer pattern — a
+      bounded memory allocation strategy that keeps memory usage constant
+      regardless of how long the application runs.
+
+
+────────────────────────────────────────────────────────────────────────────────
+UNIT V — File Systems & Virtual File System (VFS)
+────────────────────────────────────────────────────────────────────────────────
+
+3.15 The /proc Virtual Filesystem (procfs)
+      Where: task_manager.c — entire backend
+
+      /proc is the most heavily used OS concept in this project.  It is a
+      virtual filesystem provided by the Linux kernel — it has no backing
+      storage on disk.  Every file inside it is generated on-the-fly by
+      kernel code when a process opens and reads it.
+
+      Files used and what they expose:
+
+        /proc/stat              System-wide CPU tick counters (user, nice,
+                                system, idle) — used to calculate total CPU
+                                utilisation.
+
+        /proc/<pid>/comm        The executable name of process <pid>.
+                                Single-line text file.
+
+        /proc/<pid>/stat        Space-separated fields including process
+                                state, utime, stime.  Parsed with fscanf.
+
+        /proc/<pid>/status      Key-value text file.  The backend searches
+                                for "Threads:" and "VmRSS:" lines.
+
+      This is a textbook example of the VFS abstraction:  the kernel
+      presents kernel-internal data structures as ordinary files.  The
+      application uses standard file I/O calls (open, read, close) without
+      knowing it is reading virtual, in-memory data — exactly what VFS is
+      designed to achieve.
+
+3.16 .desktop File Parsing (Regular Filesystem)
+      Where: src/ui/utils/icon_loader.py
+
+      The icon loader reads .desktop files from standard XDG directories
+      (/usr/share/applications, ~/.local/share/applications, etc.) to map
+      process names to icon names.  It then searches icon theme directories
+      (/usr/share/icons/<theme>/) for the matching SVG or PNG file.
+      This demonstrates normal filesystem traversal and file parsing on
+      ext4 / btrfs / whatever the user's root partition is.
+
+
+================================================================================
+4. END-TO-END DATA FLOW
+================================================================================
+
+  1. Python launcher compiles the C backend with gcc (if needed).
+  2. Python starts the C backend as a child process via Popen (fork+exec).
+     A pipe connects the backend's stdout to the frontend.
+  3. C backend enters its main loop (runs forever, sleeps 2 s per cycle):
+       a. opendir("/proc") → iterate all numeric dirs (= all PIDs).
+       b. For each PID: read comm, stat, status → extract name, state,
+          CPU ticks, threads, VmRSS.
+       c. calculate_cpu_usage() computes delta-based CPU % using the
+          previous snapshot stored in cpu_table[].
+       d. Sort processes by CPU % descending.
+       e. Write one line per process to stdout, then "END\n", then flush.
+       f. Run nvidia-smi via popen() for GPU data; write GPU block.
+       g. sleep(2).
+  4. Python reader thread (daemon) reads lines from the pipe:
+       • Assembles lines into a frame until it sees "END".
+       • Calls root.after(0, _update_processes, frame) to hand data to
+         the main thread safely.
+       • GPU blocks are handled the same way.
+  5. Main thread (Tkinter event loop) receives the callback:
+       • Processes View: groups processes by name, classifies them as Apps
+         or Background (using window-list from wmctrl/xdotool), creates or
+         updates rows, colour-codes CPU and RAM cells.
+       • Performance View: psutil collects CPU %, memory, disk, network
+         every 1 s.  Graphs use a canvas-item-reuse strategy (coords()
+         updates instead of delete+recreate) for smooth rendering.
+  6. User clicks "End task" → os.kill(pid, SIGTERM) or SIGKILL is sent.
+
+
+================================================================================
+5. SUMMARY TABLE — SYLLABUS UNIT ↔ PROJECT CODE
+================================================================================
+
+  Unit  │ Syllabus Topic                    │ Where in the Project
+  ──────┼───────────────────────────────────┼─────────────────────────────────
+   I    │ Process concept & info            │ C backend reads /proc/<pid>/*
+   I    │ Operations on processes           │ os.kill(SIGTERM / SIGKILL)
+   I    │ Process creation                  │ Popen (fork+exec) for backend
+   I    │ System calls                      │ opendir, fopen, popen, sysconf,
+        │                                   │   sleep, os.kill
+  ──────┼───────────────────────────────────┼─────────────────────────────────
+   II   │ Multithreading                    │ Main thread + daemon reader thread
+   II   │ Thread safety                     │ root.after() callback scheduling
+   II   │ CPU scheduling observation        │ Delta-based CPU % from /proc/stat
+   II   │ Multi-core awareness              │ sysconf(_SC_NPROCESSORS_ONLN)
+  ──────┼───────────────────────────────────┼─────────────────────────────────
+   III  │ IPC                               │ Pipe (Popen stdout → readline)
+   III  │ Thread synchronisation            │ self.running flag + after() queue
+  ──────┼───────────────────────────────────┼─────────────────────────────────
+   IV   │ Paging / RSS                      │ VmRSS from /proc/<pid>/status
+   IV   │ Memory stats                      │ psutil virtual_memory()
+   IV   │ Bounded memory allocation         │ deque(maxlen=60) history buffers
+  ──────┼───────────────────────────────────┼─────────────────────────────────
+   V    │ Virtual File System (VFS)         │ Entire /proc usage in C backend
+   V    │ File I/O & traversal              │ Reading proc files + .desktop files
+  ──────┴───────────────────────────────────┴─────────────────────────────────
+
+================================================================================
